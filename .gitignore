@@ -1,0 +1,45 @@
+# autotools
+Makefile
+Makefile.in
+aclocal.m4
+autom4te.cache/
+build-aux/ar-lib
+build-aux/compile
+build-aux/config.guess
+build-aux/config.sub
+build-aux/depcomp
+build-aux/install-sh
+build-aux/ltmain.sh
+build-aux/missing
+config.h
+config.h.in
+config.log
+config.status
+configure
+configure~
+libtool
+stamp-h1
+libzello.pc
+
+# m4 generated
+m4/libtool.m4
+m4/lt~obsolete.m4
+m4/ltoptions.m4
+m4/ltsugar.m4
+m4/ltversion.m4
+
+# libtool
+*.la
+*.lo
+*.o
+.libs/
+.deps/
+
+# binaries
+examples/zello_listen
+examples/zello_tone
+tests/test_*
+
+# editors
+*.swp
+*~
