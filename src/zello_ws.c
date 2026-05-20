@@ -59,7 +59,10 @@ static const struct lws_protocols PROTOCOLS[] = {
         .user                  = NULL,
         .tx_packet_size        = 0,
     },
-    LWS_PROTOCOL_LIST_TERM
+    /* Explicit NULL-name sentinel — portable across all libwebsockets
+     * versions. LWS_PROTOCOL_LIST_TERM was added in 4.2; Debian 12
+     * ships 4.0.20 and rejects the macro. */
+    { NULL, NULL, 0, 0, 0, NULL, 0 }
 };
 
 /* ── send queue ─────────────────────────────────────────────────── */
