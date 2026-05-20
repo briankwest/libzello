@@ -1,8 +1,8 @@
 /*
  * zello_client.h — Public client API for libzello.
  *
- * Polled, single-thread, one-channel client. The caller drives the event
- * loop by calling zello_client_poll() repeatedly (e.g. every 10–20 ms).
+ * Polled, one-channel client. The caller drives the event loop by
+ * calling zello_client_poll() repeatedly (e.g. every 10–20 ms).
  *
  *   1. zello_client_create(cfg, cb)  → handle
  *   2. zello_client_start(h)         → initiates WS connect + logon
@@ -11,7 +11,17 @@
  *   4. zello_client_start_tx() → zello_client_send_pcm()* → zello_client_stop_tx()
  *   5. zello_client_stop(h); zello_client_destroy(h)
  *
- * No internal threads. All callbacks run on the thread that calls poll().
+ * Threading: every public function is safe to call from any thread
+ * (internally guarded by a recursive mutex). Callbacks fire on the
+ * thread that invokes zello_client_poll() — within a callback the
+ * caller may freely call back into libzello (e.g., start_tx from
+ * on_connected) without deadlock. zello_client_state() does not take
+ * the lock and may be polled from any thread cheaply.
+ *
+ * The typical pattern in a host with separate audio and main threads
+ * is: zello_client_send_pcm() from the audio thread,
+ * zello_client_poll() from the main thread; libzello handles the
+ * concurrency.
  */
 
 #ifndef LIBZELLO_ZELLO_CLIENT_H

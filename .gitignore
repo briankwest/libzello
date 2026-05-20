@@ -43,3 +43,17 @@ tests/test_*
 # editors
 *.swp
 *~
+
+# debian build artifacts (everything in debian/ except the source files)
+debian/.debhelper/
+debian/autoreconf.after
+debian/autoreconf.before
+debian/debhelper-build-stamp
+debian/files
+debian/libzello-dev/
+debian/libzello-dev.debhelper.log
+debian/libzello-dev.substvars
+debian/libzello0/
+debian/libzello0.debhelper.log
+debian/libzello0.substvars
+debian/tmp/

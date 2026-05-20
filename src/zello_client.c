@@ -123,6 +123,14 @@ zello_client_t *zello_client_create(const zello_config_t *cfg,
     c->next_seq   = 1;
     c->backoff_ms = c->cfg.reconnect_initial_ms;
 
+    /* Recursive so callbacks (which fire while we hold the lock from
+     * zello_client_poll) can re-enter libzello without deadlock. */
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&c->mtx, &attr);
+    pthread_mutexattr_destroy(&attr);
+
     c->ws = zello_ws_create(c);
     if (!c->ws) {
         ZLOG_E("zello_ws_create failed");
@@ -137,12 +145,18 @@ static void tx_pending_free_all(zello_client_t *c);  /* fwd */
 void zello_client_destroy(zello_client_t *c)
 {
     if (!c) return;
-    if (c->ws)  zello_ws_destroy(c->ws);
-    if (c->enc) zello_enc_destroy(c->enc);
-    if (c->dec) zello_dec_destroy(c->dec);
-
+    /* Tear down the WS first (any pending callbacks finish under lock),
+     * then drop the lock and free everything else. We don't hold the
+     * mutex while destroying the mutex itself. */
+    zcli_lock(c);
+    if (c->ws)  { zello_ws_destroy(c->ws);  c->ws  = NULL; }
+    if (c->enc) { zello_enc_destroy(c->enc); c->enc = NULL; }
+    if (c->dec) { zello_dec_destroy(c->dec); c->dec = NULL; }
     tx_pending_free_all(c);
-    free(c->tx_pcm_buf);
+    free(c->tx_pcm_buf); c->tx_pcm_buf = NULL;
+    zcli_unlock(c);
+
+    pthread_mutex_destroy(&c->mtx);
 
     free(c->cfg.server_url);
     free(c->cfg.username);
@@ -156,27 +170,35 @@ void zello_client_destroy(zello_client_t *c)
 int zello_client_start(zello_client_t *c)
 {
     if (!c) return ZELLO_ERR;
-    if (c->state != ZELLO_STATE_OFFLINE && c->state != ZELLO_STATE_RECONNECT)
-        return ZELLO_ERR_STATE;
-    ZLOG_I("zello_client_start: connecting to %s (channel=%s)",
-           c->cfg.server_url, c->cfg.channel);
-    c->state = ZELLO_STATE_CONNECTING;
-    int rc = zello_ws_connect(c->ws, c->cfg.server_url);
-    if (rc != ZELLO_OK) schedule_reconnect(c);
+    zcli_lock(c);
+    int rc;
+    if (c->state != ZELLO_STATE_OFFLINE && c->state != ZELLO_STATE_RECONNECT) {
+        rc = ZELLO_ERR_STATE;
+    } else {
+        ZLOG_I("zello_client_start: connecting to %s (channel=%s)",
+               c->cfg.server_url, c->cfg.channel);
+        c->state = ZELLO_STATE_CONNECTING;
+        rc = zello_ws_connect(c->ws, c->cfg.server_url);
+        if (rc != ZELLO_OK) schedule_reconnect(c);
+    }
+    zcli_unlock(c);
     return rc;
 }
 
 int zello_client_stop(zello_client_t *c)
 {
     if (!c) return ZELLO_ERR;
+    zcli_lock(c);
     zello_ws_close(c->ws);
     c->state = ZELLO_STATE_OFFLINE;
+    zcli_unlock(c);
     return ZELLO_OK;
 }
 
 int zello_client_poll(zello_client_t *c, int timeout_ms)
 {
     if (!c) return ZELLO_ERR;
+    zcli_lock(c);
 
     /* If we're waiting on a reconnect, see if it's time to try again. */
     if (c->state == ZELLO_STATE_RECONNECT) {
@@ -187,11 +209,19 @@ int zello_client_poll(zello_client_t *c, int timeout_ms)
         }
     }
 
-    return zello_ws_poll(c->ws, timeout_ms);
+    /* WS callbacks fire from inside lws_service() — they call into
+     * zello_on_ws_*() which is fine to run with the lock held since
+     * it's recursive. */
+    int rc = zello_ws_poll(c->ws, timeout_ms);
+    zcli_unlock(c);
+    return rc;
 }
 
 zello_state_t zello_client_state(const zello_client_t *c)
 {
+    /* `state` is a single enum word — atomic on every arch we target.
+     * We deliberately don't take the lock here so callers can poll
+     * state from any thread without contention. */
     return c ? c->state : ZELLO_STATE_OFFLINE;
 }
 
@@ -484,16 +514,18 @@ static void tx_pending_free_all(zello_client_t *c)
 int zello_client_start_tx(zello_client_t *c)
 {
     if (!c) return ZELLO_ERR;
-    if (c->state != ZELLO_STATE_ONLINE) return ZELLO_ERR_STATE;
-    if (!c->channel_ready)              return ZELLO_ERR_STATE;
-    if (c->tx_pending || c->tx_active)  return ZELLO_ERR_STATE;
+    zcli_lock(c);
+    int rc;
+    if (c->state != ZELLO_STATE_ONLINE)       { rc = ZELLO_ERR_STATE; goto out; }
+    if (!c->channel_ready)                    { rc = ZELLO_ERR_STATE; goto out; }
+    if (c->tx_pending || c->tx_active)        { rc = ZELLO_ERR_STATE; goto out; }
     if (c->cfg.listen_only) {
         ZLOG_W("zello: start_tx ignored — listen_only mode");
-        return ZELLO_ERR_STATE;
+        rc = ZELLO_ERR_STATE; goto out;
     }
 
-    int rc = tx_ensure_encoder(c);
-    if (rc != ZELLO_OK) return rc;
+    rc = tx_ensure_encoder(c);
+    if (rc != ZELLO_OK) goto out;
 
     uint8_t hdr[4];
     zello_codec_header_pack(hdr,
@@ -504,7 +536,7 @@ int zello_client_start_tx(zello_client_t *c)
     uint32_t seq = c->next_seq++;
     char *json = zello_build_start_stream(seq, c->cfg.channel, hdr,
                                            c->cfg.tx_frame_ms * c->cfg.tx_frames_per_packet);
-    if (!json) return ZELLO_ERR_NOMEM;
+    if (!json) { rc = ZELLO_ERR_NOMEM; goto out; }
     c->pending_start_stream_seq = seq;
     c->tx_pending  = true;
     c->tx_pcm_n    = 0;
@@ -512,14 +544,18 @@ int zello_client_start_tx(zello_client_t *c)
     ZLOG_I("zello: start_stream sent (seq=%u, sr=%d, frame=%dms)",
            seq, c->cfg.tx_sample_rate, c->cfg.tx_frame_ms);
     free(json);
+out:
+    zcli_unlock(c);
     return rc;
 }
 
 int zello_client_send_pcm(zello_client_t *c, const int16_t *pcm, size_t n)
 {
     if (!c || !pcm) return ZELLO_ERR;
-    if (!c->tx_pending && !c->tx_active) return ZELLO_ERR_STATE;
-    if (!c->enc || !c->tx_pcm_buf)       return ZELLO_ERR_STATE;
+    zcli_lock(c);
+    int rc = ZELLO_OK;
+    if (!c->tx_pending && !c->tx_active) { rc = ZELLO_ERR_STATE; goto out; }
+    if (!c->enc || !c->tx_pcm_buf)       { rc = ZELLO_ERR_STATE; goto out; }
 
     /* Append to accumulator, encode whenever a full frame is ready. */
     size_t off = 0;
@@ -550,13 +586,17 @@ int zello_client_send_pcm(zello_client_t *c, const int16_t *pcm, size_t n)
             }
         }
     }
-    return ZELLO_OK;
+out:
+    zcli_unlock(c);
+    return rc;
 }
 
 int zello_client_stop_tx(zello_client_t *c)
 {
     if (!c) return ZELLO_ERR;
-    if (!c->tx_pending && !c->tx_active) return ZELLO_ERR_STATE;
+    zcli_lock(c);
+    int rc = ZELLO_OK;
+    if (!c->tx_pending && !c->tx_active) { rc = ZELLO_ERR_STATE; goto out; }
 
     /* Drop any partial frame at the tail. */
     c->tx_pcm_n = 0;
@@ -581,7 +621,9 @@ int zello_client_stop_tx(zello_client_t *c)
     c->tx_active   = false;
     c->tx_pending  = false;
     c->tx_stream_id = 0;
-    return ZELLO_OK;
+out:
+    zcli_unlock(c);
+    return rc;
 }
 
 /* Called from zello_dispatch_message when a response carries our
@@ -615,11 +657,15 @@ void zello_client_handle_start_stream_response(zello_client_t *c, const cJSON *r
 int zello_client_send_text(zello_client_t *c, const char *text)
 {
     if (!c || !text) return ZELLO_ERR;
-    if (c->state != ZELLO_STATE_ONLINE) return ZELLO_ERR_STATE;
+    zcli_lock(c);
+    int rc;
+    if (c->state != ZELLO_STATE_ONLINE) { rc = ZELLO_ERR_STATE; goto out; }
     uint32_t seq = c->next_seq++;
     char *json = zello_build_text_message(seq, c->cfg.channel, text);
-    if (!json) return ZELLO_ERR_NOMEM;
-    int rc = zello_ws_send_text(c->ws, json, strlen(json));
+    if (!json) { rc = ZELLO_ERR_NOMEM; goto out; }
+    rc = zello_ws_send_text(c->ws, json, strlen(json));
     free(json);
+out:
+    zcli_unlock(c);
     return rc;
 }

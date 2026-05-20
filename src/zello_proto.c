@@ -172,6 +172,15 @@ int zello_dispatch_message(struct zello_client *c, cJSON *root)
     const cJSON *seq_v = cJSON_GetObjectItemCaseSensitive(root, "seq");
     const cJSON *cmd_v = cJSON_GetObjectItemCaseSensitive(root, "command");
 
+    {
+        char *pretty = cJSON_PrintUnformatted(root);
+        if (pretty) {
+            ZLOG_D("zello: rx msg: %.300s%s",
+                   pretty, strlen(pretty) > 300 ? "..." : "");
+            free(pretty);
+        }
+    }
+
     if (cJSON_IsNumber(seq_v) && !cJSON_IsString(cmd_v)) {
         uint32_t seq = (uint32_t)seq_v->valuedouble;
         if (seq == c->pending_logon_seq) {

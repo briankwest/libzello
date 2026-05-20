@@ -12,6 +12,7 @@
 #include "libzello/zello.h"
 #include "libzello/zello_client.h"
 
+#include <pthread.h>
 #include <stdint.h>
 
 /* Forward decls — full definitions in zello_ws.h / zello_codec.h. */
@@ -38,6 +39,13 @@ typedef struct {
 struct zello_client {
     zello_config_owned_t cfg;
     zello_callbacks_t    cb;
+
+    /* Coarse-grained recursive lock around all public-API calls and
+     * all WS-callback dispatch. Recursive so that user callbacks
+     * (fired from inside zello_client_poll while we hold the lock)
+     * may freely call back into libzello (e.g., start_tx from
+     * on_connected) without self-deadlock. */
+    pthread_mutex_t mtx;
 
     zello_state_t state;
 
@@ -96,6 +104,12 @@ struct zello_client {
 
 /* Helper used across files. */
 long zello_now_ms(void);
+
+/* Locking helpers — wrappers so we can switch to a different model
+ * later (e.g., a lock-free SPSC ring for the TX hot path) without
+ * touching every call site. */
+static inline void zcli_lock  (struct zello_client *c) { pthread_mutex_lock  (&c->mtx); }
+static inline void zcli_unlock(struct zello_client *c) { pthread_mutex_unlock(&c->mtx); }
 
 /* ── WS → client event handlers (implemented in zello_client.c) ── */
 void zello_on_ws_established(struct zello_client *c);
