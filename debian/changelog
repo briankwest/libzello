@@ -1,0 +1,10 @@
+libzello (0.1.0-1) unstable; urgency=low
+
+  * Initial release.
+  * WS transport via libwebsockets, control plane via libcjson,
+    audio via libopus (16 kHz mono, 60 ms frames).
+  * Friends & Family (wss://zello.io/ws) and Zello Work
+    (wss://zellowork.io/ws/<network>) supported via server_url.
+  * Refresh-token reconnect with exponential backoff.
+
+ -- Brian <brian@kerchunk.net>  Wed, 20 May 2026 16:00:00 +0000

@@ -1,0 +1,5 @@
+usr/include/libzello/*
+usr/lib/*/libzello.so
+usr/lib/*/libzello.a
+usr/lib/*/libzello.la
+usr/lib/*/pkgconfig/libzello.pc
