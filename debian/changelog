@@ -1,3 +1,19 @@
+libzello (0.1.1-1) unstable; urgency=low
+
+  * Replace libwebsockets with a native WebSocket implementation
+    (OpenSSL TLS + non-blocking POSIX sockets + RFC 6455 framing).
+    Removes the multi-second lws_service stalls that were starving
+    the TX path.
+  * Make the client thread-safe with a recursive control-plane mutex
+    plus a lock-free SPSC ring for the PCM data plane; a dedicated
+    service thread paces Opus encode+send at the configured frame
+    cadence (default 60 ms) so producers can push frames without
+    blocking.
+  * Build-Depends switched from libwebsockets-dev to libssl-dev.
+  * pkg-config Requires.private now lists openssl opus libcjson.
+
+ -- Brian <brian@kerchunk.net>  Thu, 21 May 2026 00:00:00 +0000
+
 libzello (0.1.0-1) unstable; urgency=low
 
   * Initial release.

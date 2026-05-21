@@ -13,6 +13,7 @@
 #include "libzello/zello_client.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 /* Forward decls — full definitions in zello_ws.h / zello_codec.h. */
@@ -87,19 +88,36 @@ struct zello_client {
     int      rx_sample_rate;
     bool     rx_active;
 
-    /* TX state. Caller streams PCM into tx_pcm_buf; full frames are
-     * encoded and either sent immediately (tx_active) or buffered
-     * (tx_pending — start_stream in flight). On start_stream response
-     * tx_stream_id is filled and the pending queue is drained. */
+    /* TX path — lock-free producer/consumer.
+     *
+     * Producer (any thread) pushes PCM samples into tx_ring via
+     * zello_client_send_pcm(). Consumer (the service thread inside
+     * zello_client_poll) drains the ring at real-time cadence, encodes
+     * one Opus frame per slot, and queues the binary packet to lws.
+     *
+     * start_tx and stop_tx are non-blocking — they set atomic flags
+     * (tx_req_start / tx_req_stop) that the service thread acts on at
+     * its next pass. Caller latency is decoupled from lws_service
+     * timing, and the service thread paces audio at frame_ms intervals
+     * so listeners hear smooth real-time audio regardless of how fast
+     * the caller pushed samples in. */
     bool     tx_pending;
     bool     tx_active;
-    int      tx_frame_samples;   /* size of one Opus frame in PCM samples */
-    int16_t *tx_pcm_buf;         /* holds partial frame (< tx_frame_samples) */
-    int      tx_pcm_n;
-    uint8_t **tx_pending_q;      /* malloc'd opus payloads (without bin header) */
-    size_t   *tx_pending_q_len;
-    size_t    tx_pending_q_n;
-    size_t    tx_pending_q_cap;
+    bool     tx_stop_after_drain;  /* set on stop request while still draining */
+    int      tx_frame_samples;
+    long     tx_next_encode_ms;    /* wall-clock target for next encode */
+    int      tx_frames_sent;       /* diagnostic: frames drained in current stream */
+    int16_t *tx_frame_buf;         /* scratch buffer for one frame */
+
+    /* PCM ring — sized in zello_client_create for ~2 s of audio. */
+    int16_t      *tx_ring;
+    size_t        tx_ring_cap;     /* number of int16 slots */
+    atomic_size_t tx_ring_w;       /* producer index (monotonic) */
+    atomic_size_t tx_ring_r;       /* consumer index (monotonic) */
+
+    /* Request flags set by start_tx/stop_tx; cleared by service thread. */
+    atomic_int    tx_req_start;
+    atomic_int    tx_req_stop;
 };
 
 /* Helper used across files. */

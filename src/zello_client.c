@@ -27,6 +27,12 @@
 #include <string.h>
 #include <time.h>
 
+/* PCM ring capacity in int16 samples (~2 s @ 16 kHz mono). */
+#define ZELLO_TX_RING_SAMPLES 32000
+
+/* Forward decls for the TX state machine — defined further down. */
+static void tx_service(zello_client_t *c);
+
 /* ── utilities ──────────────────────────────────────────────────── */
 
 static char *dup_or_null(const char *s)
@@ -131,6 +137,19 @@ zello_client_t *zello_client_create(const zello_config_t *cfg,
     pthread_mutex_init(&c->mtx, &attr);
     pthread_mutexattr_destroy(&attr);
 
+    /* SPSC PCM ring (~2 s @ 16 kHz). Lock-free from the caller's side. */
+    c->tx_ring_cap = ZELLO_TX_RING_SAMPLES;
+    c->tx_ring     = calloc(c->tx_ring_cap, sizeof(int16_t));
+    if (!c->tx_ring) {
+        ZLOG_E("tx_ring alloc failed");
+        zello_client_destroy(c);
+        return NULL;
+    }
+    atomic_init(&c->tx_ring_w,   0);
+    atomic_init(&c->tx_ring_r,   0);
+    atomic_init(&c->tx_req_start, 0);
+    atomic_init(&c->tx_req_stop,  0);
+
     c->ws = zello_ws_create(c);
     if (!c->ws) {
         ZLOG_E("zello_ws_create failed");
@@ -139,8 +158,6 @@ zello_client_t *zello_client_create(const zello_config_t *cfg,
     }
     return c;
 }
-
-static void tx_pending_free_all(zello_client_t *c);  /* fwd */
 
 void zello_client_destroy(zello_client_t *c)
 {
@@ -152,8 +169,8 @@ void zello_client_destroy(zello_client_t *c)
     if (c->ws)  { zello_ws_destroy(c->ws);  c->ws  = NULL; }
     if (c->enc) { zello_enc_destroy(c->enc); c->enc = NULL; }
     if (c->dec) { zello_dec_destroy(c->dec); c->dec = NULL; }
-    tx_pending_free_all(c);
-    free(c->tx_pcm_buf); c->tx_pcm_buf = NULL;
+    free(c->tx_ring);      c->tx_ring      = NULL;
+    free(c->tx_frame_buf); c->tx_frame_buf = NULL;
     zcli_unlock(c);
 
     pthread_mutex_destroy(&c->mtx);
@@ -208,6 +225,10 @@ int zello_client_poll(zello_client_t *c, int timeout_ms)
             zello_ws_connect(c->ws, c->cfg.server_url);
         }
     }
+
+    /* TX state machine — drive start/stop requests, drain the SPSC
+     * PCM ring at frame-ms cadence. */
+    tx_service(c);
 
     /* WS callbacks fire from inside lws_service() — they call into
      * zello_on_ws_*() which is fine to run with the lock held since
@@ -408,12 +429,7 @@ void zello_client_handle_on_stream_stop(zello_client_t *c, const cJSON *root)
     if (c->cb.on_stream_stop) c->cb.on_stream_stop(c, sid, c->cb.userdata);
 }
 
-/* ── Audio TX ───────────────────────────────────────────────────── */
-
-/* Cap on Opus packets buffered while waiting for start_stream response.
- * 32 × 60 ms = ~1.9 s — well beyond any plausible RTT. Past that we drop
- * with a warning to avoid unbounded memory growth on a stalled server. */
-#define ZELLO_TX_PENDING_MAX 32
+/* ── Audio TX — lock-free producer + paced consumer ─────────────── */
 
 /* Largest Opus payload we'll emit. Spec is 1275 bytes; pad for safety. */
 #define ZELLO_OPUS_MAX_BYTES 1500
@@ -428,10 +444,9 @@ static int tx_ensure_encoder(zello_client_t *c)
     if (!c->enc) return ZELLO_ERR_CODEC;
     c->tx_frame_samples = zello_enc_frame_samples(c->enc);
     if (c->tx_frame_samples <= 0) return ZELLO_ERR_CODEC;
-    free(c->tx_pcm_buf);
-    c->tx_pcm_buf = malloc(sizeof(int16_t) * c->tx_frame_samples);
-    if (!c->tx_pcm_buf) return ZELLO_ERR_NOMEM;
-    c->tx_pcm_n = 0;
+    free(c->tx_frame_buf);
+    c->tx_frame_buf = malloc(sizeof(int16_t) * c->tx_frame_samples);
+    if (!c->tx_frame_buf) return ZELLO_ERR_NOMEM;
     return ZELLO_OK;
 }
 
@@ -455,175 +470,193 @@ static uint8_t *tx_wrap_audio_packet(uint32_t stream_id,
     return pkt;
 }
 
-/* Enqueue an Opus payload for sending after start_stream succeeds. */
-static int tx_pending_push(zello_client_t *c, const uint8_t *opus, size_t opus_len)
+/* SPSC ring helpers — producer is the caller (any thread); consumer is
+ * the service thread inside tx_service(). Indices are monotonically
+ * increasing size_t (no wrap; the modulo happens only on access). */
+static inline size_t tx_ring_avail(zello_client_t *c)
 {
-    if (c->tx_pending_q_n >= ZELLO_TX_PENDING_MAX) {
-        ZLOG_W("zello: tx pending queue full, dropping frame");
-        return ZELLO_ERR;
-    }
-    if (c->tx_pending_q_n == c->tx_pending_q_cap) {
-        size_t ncap = c->tx_pending_q_cap ? c->tx_pending_q_cap * 2 : 8;
-        uint8_t **nq = realloc(c->tx_pending_q, ncap * sizeof(*nq));
-        size_t  *nl  = realloc(c->tx_pending_q_len, ncap * sizeof(*nl));
-        if (!nq || !nl) {
-            free(nq); free(nl);
-            return ZELLO_ERR_NOMEM;
-        }
-        c->tx_pending_q     = nq;
-        c->tx_pending_q_len = nl;
-        c->tx_pending_q_cap = ncap;
-    }
-    uint8_t *copy = malloc(opus_len);
-    if (!copy) return ZELLO_ERR_NOMEM;
-    memcpy(copy, opus, opus_len);
-    c->tx_pending_q[c->tx_pending_q_n]     = copy;
-    c->tx_pending_q_len[c->tx_pending_q_n] = opus_len;
-    c->tx_pending_q_n++;
-    return ZELLO_OK;
+    size_t w = atomic_load_explicit(&c->tx_ring_w, memory_order_acquire);
+    size_t r = atomic_load_explicit(&c->tx_ring_r, memory_order_relaxed);
+    return w - r;
 }
 
-static void tx_pending_drain(zello_client_t *c)
+static void tx_ring_reset(zello_client_t *c)
 {
-    for (size_t i = 0; i < c->tx_pending_q_n; i++) {
-        size_t pkt_len = 0;
-        uint8_t *pkt = tx_wrap_audio_packet(c->tx_stream_id,
-                                             c->tx_pending_q[i],
-                                             c->tx_pending_q_len[i],
-                                             &pkt_len);
-        if (pkt) {
-            zello_ws_send_binary(c->ws, pkt, pkt_len);
-            free(pkt);
-        }
-        free(c->tx_pending_q[i]);
-    }
-    c->tx_pending_q_n = 0;
+    /* Only safe to call when no producer is racing with us — i.e. from
+     * tx_service() under the client mutex, before the next start. */
+    atomic_store(&c->tx_ring_r, 0);
+    atomic_store(&c->tx_ring_w, 0);
 }
 
-static void tx_pending_free_all(zello_client_t *c)
+/* Consume one full frame (or `avail` samples, zero-padded) from the
+ * ring, encode, queue to lws. Called only on the service thread. */
+static void tx_drain_one_frame(zello_client_t *c, int allow_partial)
 {
-    for (size_t i = 0; i < c->tx_pending_q_n; i++) free(c->tx_pending_q[i]);
-    free(c->tx_pending_q);
-    free(c->tx_pending_q_len);
-    c->tx_pending_q     = NULL;
-    c->tx_pending_q_len = NULL;
-    c->tx_pending_q_n   = 0;
-    c->tx_pending_q_cap = 0;
+    size_t r     = atomic_load_explicit(&c->tx_ring_r, memory_order_relaxed);
+    size_t w     = atomic_load_explicit(&c->tx_ring_w, memory_order_acquire);
+    size_t avail = w - r;
+    if (avail == 0) return;
+
+    int fs = c->tx_frame_samples;
+    if ((int)avail < fs && !allow_partial) return;
+
+    size_t take = (int)avail >= fs ? (size_t)fs : avail;
+    for (size_t i = 0; i < take; i++)
+        c->tx_frame_buf[i] = c->tx_ring[(r + i) % c->tx_ring_cap];
+    for (size_t i = take; i < (size_t)fs; i++)
+        c->tx_frame_buf[i] = 0;
+    atomic_store_explicit(&c->tx_ring_r, r + take, memory_order_release);
+
+    uint8_t opus[ZELLO_OPUS_MAX_BYTES];
+    int olen = zello_enc_encode(c->enc, c->tx_frame_buf, opus, sizeof(opus));
+    if (olen <= 0) {
+        ZLOG_W("tx_drain: encode returned %d (take=%zu, fs=%d)", olen, take, fs);
+        return;
+    }
+    size_t pkt_len = 0;
+    uint8_t *pkt = tx_wrap_audio_packet(c->tx_stream_id, opus,
+                                         (size_t)olen, &pkt_len);
+    if (pkt) {
+        int rc = zello_ws_send_binary(c->ws, pkt, pkt_len);
+        if (rc != ZELLO_OK) {
+            ZLOG_W("tx_drain: ws_send_binary failed rc=%d", rc);
+        }
+        free(pkt);
+    } else {
+        ZLOG_W("tx_drain: tx_wrap_audio_packet failed");
+    }
+    c->tx_frames_sent++;
+    ZLOG_I("tx_drain: sent frame #%d (opus=%d B, ring_avail=%zu)",
+           c->tx_frames_sent, olen, tx_ring_avail(c));
 }
+
+/* Driven from zello_client_poll under the client mutex. Handles:
+ *   - tx_req_start: ensure encoder, send start_stream, mark pending
+ *   - tx_req_stop:  drain remaining audio, send stop_stream
+ *   - paced drain:  encode + send one frame per frame_ms when active
+ */
+static void tx_service(zello_client_t *c)
+{
+    /* Start request. We only clear the flag once we've actually
+     * acted on it, so a request issued while we're still finishing
+     * the previous stream doesn't get lost. */
+    if (atomic_load(&c->tx_req_start) &&
+        c->state == ZELLO_STATE_ONLINE && c->channel_ready &&
+        !c->tx_pending && !c->tx_active && !c->cfg.listen_only) {
+        atomic_store(&c->tx_req_start, 0);
+        if (tx_ensure_encoder(c) == ZELLO_OK) {
+            {
+                uint8_t hdr[4];
+                zello_codec_header_pack(hdr,
+                    (uint16_t)c->cfg.tx_sample_rate,
+                    (uint8_t)c->cfg.tx_frames_per_packet,
+                    (uint8_t)c->cfg.tx_frame_ms);
+                uint32_t seq = c->next_seq++;
+                char *json = zello_build_start_stream(seq, c->cfg.channel, hdr,
+                    c->cfg.tx_frame_ms * c->cfg.tx_frames_per_packet);
+                if (json) {
+                    c->pending_start_stream_seq = seq;
+                    c->tx_pending = true;
+                    c->tx_stop_after_drain = false;
+                    c->tx_next_encode_ms = 0;
+                    zello_ws_send_text(c->ws, json, strlen(json));
+                    ZLOG_I("zello: start_stream sent (seq=%u, sr=%d, frame=%dms)",
+                           seq, c->cfg.tx_sample_rate, c->cfg.tx_frame_ms);
+                    free(json);
+                }
+            }
+        }
+    }
+
+    /* Paced encode + send while active. Catch up to one frame per
+     * service iteration; the next iteration handles the next due frame. */
+    if (c->tx_active && c->enc && c->tx_frame_buf) {
+        long now = zello_now_ms();
+        if (c->tx_next_encode_ms == 0) c->tx_next_encode_ms = now;
+        if (now >= c->tx_next_encode_ms &&
+            tx_ring_avail(c) >= (size_t)c->tx_frame_samples) {
+            tx_drain_one_frame(c, 0);
+            c->tx_next_encode_ms += c->cfg.tx_frame_ms;
+        }
+    }
+
+    /* Stop request. */
+    if (atomic_load(&c->tx_req_stop)) {
+        if (c->tx_active) {
+            /* Keep draining at cadence until ring is empty, then send
+             * stop_stream. (We process at most one full frame per
+             * service iteration above; this branch flushes any partial
+             * remainder once nothing more fits a whole frame.) */
+            if (tx_ring_avail(c) >= (size_t)c->tx_frame_samples) {
+                /* still got whole frames — wait for next pass */
+                return;
+            }
+            /* Flush any tail samples zero-padded into a final frame so
+             * the listener gets the actual end of the audio. */
+            if (tx_ring_avail(c) > 0)
+                tx_drain_one_frame(c, 1);
+
+            uint32_t seq = c->next_seq++;
+            char *json = zello_build_stop_stream(seq, c->tx_stream_id, c->cfg.channel);
+            if (json) {
+                c->pending_stop_stream_seq = seq;
+                zello_ws_send_text(c->ws, json, strlen(json));
+                free(json);
+            }
+            ZLOG_I("zello: stop_stream sent for stream_id=%u (%d frames drained)",
+                   c->tx_stream_id, c->tx_frames_sent);
+            c->tx_active   = false;
+            c->tx_stream_id = 0;
+            c->tx_frames_sent = 0;
+        } else if (c->tx_pending) {
+            /* Stop requested before start_stream response — let the
+             * response handler send an immediate stop_stream. */
+            c->tx_stop_after_drain = true;
+        }
+        atomic_store(&c->tx_req_stop, 0);
+    }
+}
+
+/* ── Public TX API — all lock-free flag setters ─────────────────── */
 
 int zello_client_start_tx(zello_client_t *c)
 {
     if (!c) return ZELLO_ERR;
-    zcli_lock(c);
-    int rc;
-    if (c->state != ZELLO_STATE_ONLINE)       { rc = ZELLO_ERR_STATE; goto out; }
-    if (!c->channel_ready)                    { rc = ZELLO_ERR_STATE; goto out; }
-    if (c->tx_pending || c->tx_active)        { rc = ZELLO_ERR_STATE; goto out; }
-    if (c->cfg.listen_only) {
-        ZLOG_W("zello: start_tx ignored — listen_only mode");
-        rc = ZELLO_ERR_STATE; goto out;
-    }
-
-    rc = tx_ensure_encoder(c);
-    if (rc != ZELLO_OK) goto out;
-
-    uint8_t hdr[4];
-    zello_codec_header_pack(hdr,
-                             (uint16_t)c->cfg.tx_sample_rate,
-                             (uint8_t)c->cfg.tx_frames_per_packet,
-                             (uint8_t)c->cfg.tx_frame_ms);
-
-    uint32_t seq = c->next_seq++;
-    char *json = zello_build_start_stream(seq, c->cfg.channel, hdr,
-                                           c->cfg.tx_frame_ms * c->cfg.tx_frames_per_packet);
-    if (!json) { rc = ZELLO_ERR_NOMEM; goto out; }
-    c->pending_start_stream_seq = seq;
-    c->tx_pending  = true;
-    c->tx_pcm_n    = 0;
-    rc = zello_ws_send_text(c->ws, json, strlen(json));
-    ZLOG_I("zello: start_stream sent (seq=%u, sr=%d, frame=%dms)",
-           seq, c->cfg.tx_sample_rate, c->cfg.tx_frame_ms);
-    free(json);
-out:
-    zcli_unlock(c);
-    return rc;
+    if (c->cfg.listen_only) return ZELLO_ERR_STATE;
+    /* Reset the ring caller-side so any stale samples from a previous
+     * stream are dropped BEFORE the service thread sees the request and
+     * starts processing send_pcm pushes for this stream. Caller must
+     * not be racing send_pcm with start_tx (they're called sequentially
+     * in the typical flow). */
+    atomic_store(&c->tx_ring_r, 0);
+    atomic_store(&c->tx_ring_w, 0);
+    atomic_store(&c->tx_req_stop,  0);
+    atomic_store(&c->tx_req_start, 1);
+    return ZELLO_OK;
 }
 
 int zello_client_send_pcm(zello_client_t *c, const int16_t *pcm, size_t n)
 {
     if (!c || !pcm) return ZELLO_ERR;
-    zcli_lock(c);
-    int rc = ZELLO_OK;
-    if (!c->tx_pending && !c->tx_active) { rc = ZELLO_ERR_STATE; goto out; }
-    if (!c->enc || !c->tx_pcm_buf)       { rc = ZELLO_ERR_STATE; goto out; }
+    if (!c->tx_ring) return ZELLO_ERR_STATE;
 
-    /* Append to accumulator, encode whenever a full frame is ready. */
-    size_t off = 0;
-    while (off < n) {
-        size_t space = (size_t)c->tx_frame_samples - (size_t)c->tx_pcm_n;
-        size_t take  = (n - off) < space ? (n - off) : space;
-        memcpy(c->tx_pcm_buf + c->tx_pcm_n, pcm + off, take * sizeof(int16_t));
-        c->tx_pcm_n += (int)take;
-        off += take;
+    size_t w     = atomic_load_explicit(&c->tx_ring_w, memory_order_relaxed);
+    size_t r     = atomic_load_explicit(&c->tx_ring_r, memory_order_acquire);
+    size_t space = c->tx_ring_cap - (w - r);
+    if (n > space) return ZELLO_ERR;   /* ring full — caller must back off */
 
-        if (c->tx_pcm_n == c->tx_frame_samples) {
-            uint8_t opus[ZELLO_OPUS_MAX_BYTES];
-            int olen = zello_enc_encode(c->enc, c->tx_pcm_buf, opus, sizeof(opus));
-            c->tx_pcm_n = 0;
-            if (olen <= 0) continue;
+    for (size_t i = 0; i < n; i++)
+        c->tx_ring[(w + i) % c->tx_ring_cap] = pcm[i];
 
-            if (c->tx_active) {
-                size_t pkt_len = 0;
-                uint8_t *pkt = tx_wrap_audio_packet(c->tx_stream_id,
-                                                    opus, (size_t)olen, &pkt_len);
-                if (pkt) {
-                    zello_ws_send_binary(c->ws, pkt, pkt_len);
-                    free(pkt);
-                }
-            } else {
-                /* tx_pending — start_stream still in flight. Buffer. */
-                tx_pending_push(c, opus, (size_t)olen);
-            }
-        }
-    }
-out:
-    zcli_unlock(c);
-    return rc;
+    atomic_store_explicit(&c->tx_ring_w, w + n, memory_order_release);
+    return ZELLO_OK;
 }
 
 int zello_client_stop_tx(zello_client_t *c)
 {
     if (!c) return ZELLO_ERR;
-    zcli_lock(c);
-    int rc = ZELLO_OK;
-    if (!c->tx_pending && !c->tx_active) { rc = ZELLO_ERR_STATE; goto out; }
-
-    /* Drop any partial frame at the tail. */
-    c->tx_pcm_n = 0;
-
-    if (c->tx_active) {
-        uint32_t seq = c->next_seq++;
-        char *json = zello_build_stop_stream(seq, c->tx_stream_id, c->cfg.channel);
-        if (json) {
-            c->pending_stop_stream_seq = seq;
-            zello_ws_send_text(c->ws, json, strlen(json));
-            free(json);
-        }
-        ZLOG_I("zello: stop_stream sent for stream_id=%u", c->tx_stream_id);
-    } else {
-        /* Cancelled before start_stream response arrived — just drop the
-         * pending queue. If the response arrives later we'll honour the
-         * stop in zello_client_handle_start_stream_response. */
-        ZLOG_I("zello: stop_tx before start_stream response — discarding pending");
-        tx_pending_free_all(c);
-    }
-
-    c->tx_active   = false;
-    c->tx_pending  = false;
-    c->tx_stream_id = 0;
-out:
-    zcli_unlock(c);
-    return rc;
+    atomic_store(&c->tx_req_stop, 1);
+    return ZELLO_OK;
 }
 
 /* Called from zello_dispatch_message when a response carries our
@@ -635,23 +668,41 @@ void zello_client_handle_start_stream_response(zello_client_t *c, const cJSON *r
     if (cJSON_IsString(err)) {
         ZLOG_E("zello: start_stream failed: %s", err->valuestring);
         if (c->cb.on_error) c->cb.on_error(c, err->valuestring, c->cb.userdata);
-        tx_pending_free_all(c);
         c->tx_pending = false;
+        c->tx_stop_after_drain = false;
+        tx_ring_reset(c);
         return;
     }
     const cJSON *sid = cJSON_GetObjectItemCaseSensitive(root, "stream_id");
     if (!cJSON_IsNumber(sid)) {
         ZLOG_E("zello: start_stream response missing stream_id");
-        tx_pending_free_all(c);
         c->tx_pending = false;
+        c->tx_stop_after_drain = false;
         return;
     }
     c->tx_stream_id = (uint32_t)sid->valuedouble;
-    c->tx_active    = true;
     c->tx_pending   = false;
-    ZLOG_I("zello: start_stream ok, stream_id=%u, draining %zu pending",
-           c->tx_stream_id, c->tx_pending_q_n);
-    tx_pending_drain(c);
+
+    if (c->tx_stop_after_drain) {
+        c->tx_stop_after_drain = false;
+        uint32_t seq = c->next_seq++;
+        char *json = zello_build_stop_stream(seq, c->tx_stream_id, c->cfg.channel);
+        if (json) {
+            c->pending_stop_stream_seq = seq;
+            zello_ws_send_text(c->ws, json, strlen(json));
+            free(json);
+        }
+        ZLOG_I("zello: late start_stream ok (stream_id=%u) — sending immediate stop",
+               c->tx_stream_id);
+        c->tx_stream_id = 0;
+        return;
+    }
+
+    c->tx_active         = true;
+    c->tx_next_encode_ms = zello_now_ms();
+    c->tx_frames_sent    = 0;
+    ZLOG_I("zello: start_stream ok, stream_id=%u (%zu samples queued, fs=%d)",
+           c->tx_stream_id, tx_ring_avail(c), c->tx_frame_samples);
 }
 
 int zello_client_send_text(zello_client_t *c, const char *text)

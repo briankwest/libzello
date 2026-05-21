@@ -13,7 +13,6 @@
 #include "zello_log.h"
 #include "libzello/zello_client.h"
 
-#include <libwebsockets.h>          /* for lws_b64_* */
 #include <cjson/cJSON.h>
 #include <stdlib.h>
 #include <string.h>
@@ -111,26 +110,78 @@ char *zello_build_text_message(uint32_t seq, const char *channel, const char *te
     return json_render_and_free(r);
 }
 
-/* ── base64 (wraps libwebsockets) ───────────────────────────────── */
+/* ── base64 (RFC 4648, no line breaks) ──────────────────────────── */
+
+static const char b64tab[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 char *zello_b64_encode(const uint8_t *in, size_t n)
 {
     if (!in) return NULL;
-    /* Standard b64 expands by 4/3, plus padding & NUL. */
-    size_t out_max = ((n + 2) / 3) * 4 + 4;
+    size_t out_max = ((n + 2) / 3) * 4 + 1;
     char *out = malloc(out_max);
     if (!out) return NULL;
-    int written = lws_b64_encode_string((const char *)in, (int)n, out, (int)out_max);
-    if (written < 0) { free(out); return NULL; }
+
+    size_t i = 0, o = 0;
+    while (i + 3 <= n) {
+        uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i+1] << 8) | in[i+2];
+        out[o++] = b64tab[(v >> 18) & 0x3F];
+        out[o++] = b64tab[(v >> 12) & 0x3F];
+        out[o++] = b64tab[(v >>  6) & 0x3F];
+        out[o++] = b64tab[ v        & 0x3F];
+        i += 3;
+    }
+    if (i < n) {
+        uint32_t v = (uint32_t)in[i] << 16;
+        if (i + 1 < n) v |= (uint32_t)in[i+1] << 8;
+        out[o++] = b64tab[(v >> 18) & 0x3F];
+        out[o++] = b64tab[(v >> 12) & 0x3F];
+        out[o++] = (i + 1 < n) ? b64tab[(v >> 6) & 0x3F] : '=';
+        out[o++] = '=';
+    }
+    out[o] = 0;
     return out;
+}
+
+static int b64val(unsigned char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
 }
 
 int zello_b64_decode(const char *in, uint8_t *out, size_t out_max, size_t *out_n)
 {
     if (!in || !out) return ZELLO_ERR;
-    int n = lws_b64_decode_string(in, (char *)out, (int)out_max);
-    if (n < 0) return ZELLO_ERR;
-    if (out_n) *out_n = (size_t)n;
+    size_t o = 0;
+    int    buf[4];
+    int    bn = 0;
+    while (*in) {
+        unsigned char c = (unsigned char)*in++;
+        if (c == '=' || c == 0) break;
+        int v = b64val(c);
+        if (v < 0) continue;  /* skip whitespace / unknown */
+        buf[bn++] = v;
+        if (bn == 4) {
+            if (o + 3 > out_max) return ZELLO_ERR;
+            out[o++] = (uint8_t)((buf[0] << 2) | (buf[1] >> 4));
+            out[o++] = (uint8_t)((buf[1] << 4) | (buf[2] >> 2));
+            out[o++] = (uint8_t)((buf[2] << 6) |  buf[3]);
+            bn = 0;
+        }
+    }
+    if (bn >= 2) {
+        if (o + 1 > out_max) return ZELLO_ERR;
+        out[o++] = (uint8_t)((buf[0] << 2) | (buf[1] >> 4));
+        if (bn >= 3) {
+            if (o + 1 > out_max) return ZELLO_ERR;
+            out[o++] = (uint8_t)((buf[1] << 4) | (buf[2] >> 2));
+        }
+    }
+    if (out_n) *out_n = o;
     return ZELLO_OK;
 }
 

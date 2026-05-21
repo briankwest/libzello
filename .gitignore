@@ -38,7 +38,12 @@ m4/ltversion.m4
 # binaries
 examples/zello_listen
 examples/zello_tone
+examples/zello_cli
 tests/test_*
+
+# backup files
+*.bak
+.*.bak
 
 # editors
 *.swp

@@ -8,4 +8,4 @@ Description: Zello Channel API client library (WebSocket + Opus)
 Version: @PACKAGE_VERSION@
 Libs: -L${libdir} -lzello
 Cflags: -I${includedir}
-Requires.private: libwebsockets opus libcjson
+Requires.private: openssl opus libcjson

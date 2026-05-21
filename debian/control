@@ -5,9 +5,10 @@ Maintainer: Brian <brian@kerchunk.net>
 Build-Depends:
  debhelper-compat (= 13),
  dh-autoreconf,
- libwebsockets-dev,
+ libssl-dev,
  libopus-dev,
  libcjson-dev,
+ libtool,
  pkg-config,
 Standards-Version: 4.6.2
 Homepage: https://github.com/briankwest/libzello
@@ -22,7 +23,8 @@ Description: Zello Channel API client library
  A C client library for the Zello Channel API (WebSocket + JSON
  control plane, binary Opus audio). Supports Zello Friends & Family
  (zello.io) and Zello Work (zellowork.io). One channel per client,
- full duplex. Polled single-thread API with refresh-token reconnect.
+ full duplex. Thread-safe API with a lock-free SPSC PCM ring on the
+ transmit path and refresh-token reconnect.
 
 Package: libzello-dev
 Architecture: any
@@ -32,5 +34,5 @@ Depends: libzello0 (= ${binary:Version}), ${misc:Depends}
 Description: Zello Channel API client library (development files)
  Headers and pkg-config file needed to build programs that link
  against libzello. The library implements the Zello Channel API
- over WebSocket (libwebsockets) with Opus audio (libopus) and JSON
+ over WebSocket (native + OpenSSL) with Opus audio (libopus) and JSON
  control plane (libcjson).

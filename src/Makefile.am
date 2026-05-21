@@ -18,14 +18,14 @@ libzello_la_CFLAGS = \
 	-I$(top_srcdir)/include \
 	-I$(top_srcdir)/src \
 	-DLIBZELLO_GIT_HASH=\"$(GIT_HASH)\" \
-	$(LIBWEBSOCKETS_CFLAGS) \
+	$(OPENSSL_CFLAGS) \
 	$(OPUS_CFLAGS) \
 	$(CJSON_CFLAGS)
 
 libzello_la_LDFLAGS = -version-info 0:0:0
 
 libzello_la_LIBADD = \
-	$(LIBWEBSOCKETS_LIBS) \
+	$(OPENSSL_LIBS) \
 	$(OPUS_LIBS) \
 	$(CJSON_LIBS) \
 	-lpthread \

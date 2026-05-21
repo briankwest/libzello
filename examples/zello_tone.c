@@ -9,15 +9,18 @@
  *     ZELLO_CHANNEL=<chan> ./zello_tone
  */
 
+#define _POSIX_C_SOURCE 200809L
+#define _USE_MATH_DEFINES
+
 #include <libzello/zello_client.h>
 #include <libzello/zello.h>
 
-#define _USE_MATH_DEFINES
 #include <math.h>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -93,12 +96,17 @@ int main(void)
         return 1;
     }
 
-    /* Wait up to 5 s for logon. */
-    int waited = 0;
-    while (!g_connected && waited < 5000) {
+    /* Wait up to 10 s for logon — wall-clock, not tick-counter, because
+     * lws_service returns immediately during the connect event flurry. */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long deadline_ms = (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000L + 10000;
+    long now_ms;
+    do {
         zello_client_poll(c, 100);
-        waited += 100;
-    }
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        now_ms = (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000L;
+    } while (!g_connected && now_ms < deadline_ms);
     if (!g_connected) {
         fprintf(stderr, "timed out waiting for logon\n");
         zello_client_destroy(c);
