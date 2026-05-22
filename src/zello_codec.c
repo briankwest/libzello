@@ -66,6 +66,12 @@ int zello_enc_frame_samples(const struct zello_enc *e)
     return e ? e->frame_samples : 0;
 }
 
+void zello_enc_reset(struct zello_enc *e)
+{
+    if (!e || !e->enc) return;
+    opus_encoder_ctl(e->enc, OPUS_RESET_STATE);
+}
+
 int zello_enc_encode(struct zello_enc *e,
                       const int16_t *pcm, uint8_t *out, size_t max_out)
 {

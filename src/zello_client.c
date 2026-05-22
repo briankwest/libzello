@@ -31,7 +31,8 @@
 #define ZELLO_TX_RING_SAMPLES 32000
 
 /* Forward decls for the TX state machine — defined further down. */
-static void tx_service(zello_client_t *c);
+static void          tx_service(zello_client_t *c);
+static inline size_t tx_ring_avail(zello_client_t *c);
 
 /* ── utilities ──────────────────────────────────────────────────── */
 
@@ -145,10 +146,11 @@ zello_client_t *zello_client_create(const zello_config_t *cfg,
         zello_client_destroy(c);
         return NULL;
     }
-    atomic_init(&c->tx_ring_w,   0);
-    atomic_init(&c->tx_ring_r,   0);
+    atomic_init(&c->tx_ring_w,    0);
+    atomic_init(&c->tx_ring_r,    0);
     atomic_init(&c->tx_req_start, 0);
     atomic_init(&c->tx_req_stop,  0);
+    atomic_init(&c->tx_streaming, 0);
 
     c->ws = zello_ws_create(c);
     if (!c->ws) {
@@ -230,10 +232,35 @@ int zello_client_poll(zello_client_t *c, int timeout_ms)
      * PCM ring at frame-ms cadence. */
     tx_service(c);
 
-    /* WS callbacks fire from inside lws_service() — they call into
+    /* Cap the WS poll timeout while a TX is active so the service
+     * thread comes back in time for the next drain slot. Without this
+     * cap, a caller that requested e.g. timeout_ms=100 would block in
+     * poll() for the full 100 ms after a drain, then drain one more
+     * frame — net drain rate ≈ 1 frame per 100 ms = 9.6 kHz, well
+     * under the producer's 16 kHz. Ring grows unbounded, listeners
+     * hear audio arriving late and Opus PLC fills the gaps with
+     * static. Time-until-next-drain is always ≤ frame_ms while
+     * active. */
+    int effective_timeout = timeout_ms;
+    if (c->tx_active && c->cfg.tx_frame_ms > 0) {
+        long now      = zello_now_ms();
+        long until_ms = c->tx_next_encode_ms - now;
+        if (until_ms < 0) until_ms = 0;
+        if (until_ms > c->cfg.tx_frame_ms) until_ms = c->cfg.tx_frame_ms;
+        /* If we're "due" but the ring doesn't have a full frame yet,
+         * sleep a little anyway instead of spinning — producer pushes
+         * every ~20 ms, so half that gives it a turn without starving
+         * the drain. */
+        if (until_ms == 0 &&
+            tx_ring_avail(c) < (size_t)c->tx_frame_samples)
+            until_ms = 10;
+        if (effective_timeout > (int)until_ms) effective_timeout = (int)until_ms;
+    }
+
+    /* WS callbacks fire from inside zello_ws_poll — they call into
      * zello_on_ws_*() which is fine to run with the lock held since
-     * it's recursive. */
-    int rc = zello_ws_poll(c->ws, timeout_ms);
+     * the mutex is recursive. */
+    int rc = zello_ws_poll(c->ws, effective_timeout);
     zcli_unlock(c);
     return rc;
 }
@@ -313,6 +340,8 @@ static void handle_binary_audio(zello_client_t *c, const uint8_t *buf, size_t le
     int16_t pcm[ZELLO_RX_MAX_SAMPLES];
     int n = zello_dec_decode(c->dec, opus, opus_len, pcm, ZELLO_RX_MAX_SAMPLES);
     if (n < 0) return;
+    ZLOG_D("zello: rx audio sid=%u opus=%zu B pcm=%d samples @ %d Hz",
+           stream_id, opus_len, n, c->rx_sample_rate);
     if (c->cb.on_audio)
         c->cb.on_audio(c, stream_id, pcm, (size_t)n, c->rx_sample_rate, c->cb.userdata);
 }
@@ -345,7 +374,19 @@ void zello_client_handle_logon_response(zello_client_t *c, const cJSON *root)
     if (cJSON_IsString(err)) {
         ZLOG_E("zello: logon failed: %s", err->valuestring);
         if (c->cb.on_error) c->cb.on_error(c, err->valuestring, c->cb.userdata);
-        /* Reset backoff to a longer interval — auth errors don't fix themselves. */
+        /* When the failure was on a refresh-token logon, throw the
+         * refresh_token away so the next reconnect falls back to a
+         * fresh username+password logon. Common case: the user logged
+         * in elsewhere with the same account, the server kicked us,
+         * and the refresh_token we cached is no longer valid — server
+         * responds "not authorized" / "no permission" indefinitely
+         * unless we re-auth from scratch. */
+        if (c->refresh_token) {
+            ZLOG_I("zello: clearing stale refresh_token after logon error — "
+                   "next reconnect will use username+password");
+            free(c->refresh_token);
+            c->refresh_token = NULL;
+        }
         return;
     }
 
@@ -451,8 +492,16 @@ static int tx_ensure_encoder(zello_client_t *c)
 }
 
 /* Build the 9-byte audio header + Opus payload into one buffer. Caller
- * frees with free(). */
-static uint8_t *tx_wrap_audio_packet(uint32_t stream_id,
+ * frees with free().
+ *
+ * The published API doc says "packet_id is ignored on outbound, fill
+ * with zeros" — but the official zello-channel-api JS SDK actually
+ * fills packet_id with a per-stream sequence starting at 1
+ * (outgoingMessage.js: ++this.currentPacketId). Listeners hearing only
+ * static when we sent packet_id=0 for every packet suggests the
+ * server-side path now relies on the sequence number for re-timing /
+ * de-duplication, so match the SDK. */
+static uint8_t *tx_wrap_audio_packet(uint32_t stream_id, uint32_t packet_id,
                                       const uint8_t *opus, size_t opus_len,
                                       size_t *out_len)
 {
@@ -464,7 +513,10 @@ static uint8_t *tx_wrap_audio_packet(uint32_t stream_id,
     pkt[2] = (uint8_t)((stream_id >> 16) & 0xFF);
     pkt[3] = (uint8_t)((stream_id >>  8) & 0xFF);
     pkt[4] = (uint8_t)((stream_id      ) & 0xFF);
-    pkt[5] = pkt[6] = pkt[7] = pkt[8] = 0; /* packet_id = 0 outbound */
+    pkt[5] = (uint8_t)((packet_id >> 24) & 0xFF);
+    pkt[6] = (uint8_t)((packet_id >> 16) & 0xFF);
+    pkt[7] = (uint8_t)((packet_id >>  8) & 0xFF);
+    pkt[8] = (uint8_t)((packet_id      ) & 0xFF);
     memcpy(pkt + ZELLO_BIN_HEADER_LEN, opus, opus_len);
     *out_len = total;
     return pkt;
@@ -513,9 +565,13 @@ static void tx_drain_one_frame(zello_client_t *c, int allow_partial)
         ZLOG_W("tx_drain: encode returned %d (take=%zu, fs=%d)", olen, take, fs);
         return;
     }
+    c->tx_frames_sent++;
     size_t pkt_len = 0;
-    uint8_t *pkt = tx_wrap_audio_packet(c->tx_stream_id, opus,
-                                         (size_t)olen, &pkt_len);
+    /* packet_id starts at 1 for the first audio packet of the stream
+     * (matches the JS SDK's currentPacketId pre-increment from 0). */
+    uint8_t *pkt = tx_wrap_audio_packet(c->tx_stream_id,
+                                         (uint32_t)c->tx_frames_sent,
+                                         opus, (size_t)olen, &pkt_len);
     if (pkt) {
         int rc = zello_ws_send_binary(c->ws, pkt, pkt_len);
         if (rc != ZELLO_OK) {
@@ -525,7 +581,6 @@ static void tx_drain_one_frame(zello_client_t *c, int allow_partial)
     } else {
         ZLOG_W("tx_drain: tx_wrap_audio_packet failed");
     }
-    c->tx_frames_sent++;
     ZLOG_I("tx_drain: sent frame #%d (opus=%d B, ring_avail=%zu)",
            c->tx_frames_sent, olen, tx_ring_avail(c));
 }
@@ -545,38 +600,56 @@ static void tx_service(zello_client_t *c)
         !c->tx_pending && !c->tx_active && !c->cfg.listen_only) {
         atomic_store(&c->tx_req_start, 0);
         if (tx_ensure_encoder(c) == ZELLO_OK) {
-            {
-                uint8_t hdr[4];
-                zello_codec_header_pack(hdr,
-                    (uint16_t)c->cfg.tx_sample_rate,
-                    (uint8_t)c->cfg.tx_frames_per_packet,
-                    (uint8_t)c->cfg.tx_frame_ms);
-                uint32_t seq = c->next_seq++;
-                char *json = zello_build_start_stream(seq, c->cfg.channel, hdr,
-                    c->cfg.tx_frame_ms * c->cfg.tx_frames_per_packet);
-                if (json) {
-                    c->pending_start_stream_seq = seq;
-                    c->tx_pending = true;
-                    c->tx_stop_after_drain = false;
-                    c->tx_next_encode_ms = 0;
-                    zello_ws_send_text(c->ws, json, strlen(json));
-                    ZLOG_I("zello: start_stream sent (seq=%u, sr=%d, frame=%dms)",
-                           seq, c->cfg.tx_sample_rate, c->cfg.tx_frame_ms);
-                    free(json);
-                }
+            /* Fresh encoder state per stream. The listener gets a new
+             * stream_id from the server and starts a fresh decoder; if
+             * we kept residual prediction/LPC state from the previous
+             * stream, the first ~100ms of audio decoded against a clean
+             * decoder would come out as garbled noise. */
+            zello_enc_reset(c->enc);
+            uint8_t hdr[4];
+            zello_codec_header_pack(hdr,
+                (uint16_t)c->cfg.tx_sample_rate,
+                (uint8_t)c->cfg.tx_frames_per_packet,
+                (uint8_t)c->cfg.tx_frame_ms);
+            uint32_t seq = c->next_seq++;
+            char *json = zello_build_start_stream(seq, c->cfg.channel, hdr,
+                c->cfg.tx_frame_ms * c->cfg.tx_frames_per_packet);
+            if (json) {
+                c->pending_start_stream_seq = seq;
+                c->tx_pending = true;
+                c->tx_stop_after_drain = false;
+                c->tx_next_encode_ms = 0;
+                c->tx_frames_sent = 0;
+                zello_ws_send_text(c->ws, json, strlen(json));
+                ZLOG_I("zello: start_stream sent (seq=%u, sr=%d, frame=%dms)",
+                       seq, c->cfg.tx_sample_rate, c->cfg.tx_frame_ms);
+                free(json);
             }
         }
     }
 
-    /* Paced encode + send while active. Catch up to one frame per
-     * service iteration; the next iteration handles the next due frame. */
+    /* Paced encode + send while active.
+     *
+     * After each drain we set tx_next_encode_ms = now + frame_ms (not
+     * += frame_ms): this prevents the "catch-up burst" where, if a
+     * service-thread tick was delayed, the next tick would fire two or
+     * three drains back-to-back to make up for it. Zello listeners
+     * apparently re-time packets based on inter-arrival rather than a
+     * per-packet timestamp, so bursts come out as garbled audio on the
+     * receiver. Producer is a real-time audio thread pushing samples
+     * at the encoder's nominal rate, so capping consumer to that same
+     * rate is the right equilibrium — back-pressure isn't a concern.
+     *
+     * We still allow only one frame per service iteration; ws_poll
+     * comes back promptly when there's work to do, so this is
+     * sufficient to keep up with the producer in steady state. */
     if (c->tx_active && c->enc && c->tx_frame_buf) {
         long now = zello_now_ms();
         if (c->tx_next_encode_ms == 0) c->tx_next_encode_ms = now;
         if (now >= c->tx_next_encode_ms &&
             tx_ring_avail(c) >= (size_t)c->tx_frame_samples) {
             tx_drain_one_frame(c, 0);
-            c->tx_next_encode_ms += c->cfg.tx_frame_ms;
+            c->tx_next_encode_ms = now + c->cfg.tx_frame_ms;
         }
     }
 
@@ -623,15 +696,16 @@ int zello_client_start_tx(zello_client_t *c)
 {
     if (!c) return ZELLO_ERR;
     if (c->cfg.listen_only) return ZELLO_ERR_STATE;
-    /* Reset the ring caller-side so any stale samples from a previous
-     * stream are dropped BEFORE the service thread sees the request and
-     * starts processing send_pcm pushes for this stream. Caller must
-     * not be racing send_pcm with start_tx (they're called sequentially
-     * in the typical flow). */
-    atomic_store(&c->tx_ring_r, 0);
-    atomic_store(&c->tx_ring_w, 0);
-    atomic_store(&c->tx_req_stop,  0);
-    atomic_store(&c->tx_req_start, 1);
+    /* Open the producer gate AFTER resetting the ring so a concurrent
+     * send_pcm thread can't write into stale indices. The gate (zero ->
+     * one) is the LAST store, with release semantics; producers do an
+     * acquire load before any ring write, so by the time they observe
+     * the gate open, they also observe ring_r/ring_w = 0. */
+    atomic_store_explicit(&c->tx_ring_r,    0, memory_order_relaxed);
+    atomic_store_explicit(&c->tx_ring_w,    0, memory_order_relaxed);
+    atomic_store_explicit(&c->tx_req_stop,  0, memory_order_relaxed);
+    atomic_store_explicit(&c->tx_req_start, 1, memory_order_relaxed);
+    atomic_store_explicit(&c->tx_streaming, 1, memory_order_release);
     return ZELLO_OK;
 }
 
@@ -639,6 +713,14 @@ int zello_client_send_pcm(zello_client_t *c, const int16_t *pcm, size_t n)
 {
     if (!c || !pcm) return ZELLO_ERR;
     if (!c->tx_ring) return ZELLO_ERR_STATE;
+
+    /* Acquire-load on the streaming gate. Pairs with the release-store
+     * in zello_client_start_tx: if we see streaming=1, we also see the
+     * ring indices reset to 0. Outside a stream we drop samples
+     * silently — the caller hasn't called start_tx, or it called
+     * stop_tx, and either way there's no consumer for these bytes. */
+    if (atomic_load_explicit(&c->tx_streaming, memory_order_acquire) == 0)
+        return ZELLO_OK;
 
     size_t w     = atomic_load_explicit(&c->tx_ring_w, memory_order_relaxed);
     size_t r     = atomic_load_explicit(&c->tx_ring_r, memory_order_acquire);
@@ -655,6 +737,12 @@ int zello_client_send_pcm(zello_client_t *c, const int16_t *pcm, size_t n)
 int zello_client_stop_tx(zello_client_t *c)
 {
     if (!c) return ZELLO_ERR;
+    /* Close the producer gate FIRST so concurrent send_pcm calls bail
+     * out and can't slip writes into the ring after the service thread
+     * has already drained it. The req_stop flag is then picked up by
+     * the service thread, which flushes whatever the producer pushed
+     * before observing the gate=0. */
+    atomic_store_explicit(&c->tx_streaming, 0, memory_order_release);
     atomic_store(&c->tx_req_stop, 1);
     return ZELLO_OK;
 }

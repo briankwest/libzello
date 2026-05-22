@@ -18,6 +18,12 @@ int zello_enc_encode(struct zello_enc *e,
 
 int zello_enc_frame_samples(const struct zello_enc *e);
 
+/* Reset encoder state. Call this at the start of a new logical TX so
+ * residual prediction state from the previous stream can't leak into
+ * the first few frames of the new one — listeners see each stream as
+ * a fresh decode session, so the encoder side should match. */
+void zello_enc_reset(struct zello_enc *e);
+
 struct zello_dec *zello_dec_create(int sample_rate);
 void              zello_dec_destroy(struct zello_dec *d);
 

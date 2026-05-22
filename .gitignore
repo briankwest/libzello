@@ -39,7 +39,10 @@ m4/ltversion.m4
 examples/zello_listen
 examples/zello_tone
 examples/zello_cli
+# Ignore compiled test binaries but keep their .c sources tracked.
 tests/test_*
+!tests/test_*.c
+!tests/test_*.h
 
 # backup files
 *.bak

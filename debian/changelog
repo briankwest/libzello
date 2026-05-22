@@ -1,3 +1,48 @@
+libzello (0.1.6-1) unstable; urgency=low
+
+  * tx: cap the WS poll timeout to time-until-next-drain while a TX
+    is active. Callers that ran poll() with a 100 ms timeout were
+    blocking the full 100 ms between drains, capping outbound rate
+    at one frame per 100 ms (9.6 kHz) while the producer pushed at
+    16 kHz. Ring grew unbounded, audio arrived late at the Zello
+    server, and listeners heard Opus PLC fill the gaps with static.
+  * tx: outbound packet_id now starts at 1 and increments per frame
+    instead of being zero on every packet. The published API doc
+    says packet_id is ignored on outbound, but the official JS SDK
+    (zello-channel-api outgoingMessage.js) actually sends a sequence
+    and the server-side path appears to use it for re-timing.
+  * tx: reset the Opus encoder state at the start of each new stream
+    (OPUS_RESET_STATE). Listeners start a fresh decoder per
+    stream_id, so residual prediction state from the previous stream
+    used to come out as garbled audio in the first few frames.
+  * tx: serialize ring reset against the producer thread via a new
+    tx_streaming atomic gate. start_tx opens it AFTER zeroing the
+    ring indices; stop_tx closes it BEFORE flagging the drain;
+    send_pcm drops samples while the gate is closed. Eliminates a
+    race where the producer could push samples into a stale write
+    index and have them overwritten by the reset.
+  * tx: drain at a strict frame_ms cadence — tx_next_encode_ms is
+    reset to (now + frame_ms) after each drain instead of advancing
+    by frame_ms from the previous schedule. Stops the back-to-back
+    burst drains that arrived at Zello listeners as garbled audio.
+  * rx: add a DEBUG log per inbound audio packet (stream_id, opus
+    bytes, decoded sample count, sample rate). Lets you compare wire
+    sizes between our outbound and what live clients push.
+  * reconnect: drop the cached refresh_token on logon failure. When
+    another client logs in with the same account the server evicts
+    our session and invalidates the refresh_token. Without this fix
+    we kept retrying with the dead token forever and got "no
+    permission" on every reconnect; now we fall back to a fresh
+    username+password logon on the next attempt and recover as soon
+    as the conflicting client exits.
+  * tests: new test_codec_roundtrip program that loads a 16-bit
+    mono WAV, encodes through libzello's Opus + Zello packet
+    wrapping, unwraps + decodes, and writes the reconstruction. Used
+    to verify the codec/protocol path independently of WS/server
+    behaviour when diagnosing audio garbling.
+
+ -- Brian <brian@kerchunk.net>  Fri, 22 May 2026 00:00:00 +0000
+
 libzello (0.1.1-1) unstable; urgency=low
 
   * Replace libwebsockets with a native WebSocket implementation

@@ -118,6 +118,16 @@ struct zello_client {
     /* Request flags set by start_tx/stop_tx; cleared by service thread. */
     atomic_int    tx_req_start;
     atomic_int    tx_req_stop;
+
+    /* Producer gate. send_pcm only writes to the ring while this is 1.
+     * Lifecycle:
+     *   start_tx:    set to 1 LAST, after the ring indices are reset.
+     *                Any producer thread observing 1 also observes the
+     *                fresh ring state.
+     *   stop_tx:     set to 0 FIRST. Any producer push after this point
+     *                is dropped, so the service thread can drain what's
+     *                in the ring without racing further writes. */
+    atomic_int    tx_streaming;
 };
 
 /* Helper used across files. */

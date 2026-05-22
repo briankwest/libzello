@@ -41,9 +41,11 @@ typedef enum {
 #define ZELLO_LOG_ERROR  3
 
 /* Audio: Opus mono. The Zello codec_header carries (sample_rate,
- * frames_per_packet, frame_size_ms). libzello defaults are below; the
- * server-side codec_header on inbound streams may differ and is exposed
- * to the caller via on_stream_start. */
+ * frames_per_packet, frame_size_ms). libzello defaults match what the
+ * Android/iOS Zello apps actually send (observed on the wire: 16 kHz,
+ * 60 ms frames). The API spec's published example is the same; the
+ * JS SDK is the outlier with 20 ms. The server-side codec_header on
+ * inbound streams may still differ and is exposed via on_stream_start. */
 #define ZELLO_DEFAULT_SAMPLE_RATE     16000
 #define ZELLO_DEFAULT_FRAME_MS        60
 #define ZELLO_DEFAULT_FRAMES_PER_PKT  1
